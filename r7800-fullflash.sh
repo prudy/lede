@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VER="1.0"
+VER="1.1"
 
 help() {
     echo "Execute:"
@@ -38,39 +38,6 @@ err() {
     [ -n "$WORKDIR" -a -d "$WORKDIR" ] && rm -rf "$WORKDIR"
     exit
 }
-
-declare -A DTB_ORIGINAL=(
-["ubi@168"]="00 00 00 9c 01 68 00 00 01 e0 00 00"
-["firmware@148"]="00 00 00 9c 01 48 00 00 02 00 00 00"
-)
-
-declare -A DTB_MODIFIED=(
-["ubi@168"]="00 00 00 9c 01 68 00 00 06 28 00 00"
-["firmware@148"]="00 00 00 9c 01 48 00 00 06 48 00 00"
-)
-
-KERNEL_FILENAME="kernel"
-
-# <file>
-updatedtb() {
-    local len=80
-    local label
-    local offset
-    local pattern
-    local modified
-    local rawd
-    
-    for label in ${!DTB_ORIGINAL[*]}; do
-	offset=$(strings -a -t d "$1" | sed -n "/${label}/s/^ *\([0-9a-f]*\) .*\$/\1/p") || err "${LINENO} $label"
-	pattern=$(od "$1" -j $offset -A n -v -t x1 -N $len | tr -d "\n\r") || err "${LINENO} $label"
-	modified="${pattern/${DTB_ORIGINAL[$label]}/${DTB_MODIFIED[$label]}}" || err "${LINENO} $label"
-	[ "$pattern" == "$modified" ] && err "${LINENO} $label"
-	rawd="$(echo "$modified" | sed 's/ /\\x/g')" || err "${LINENO} $label"
-	echo -ne "$rawd" | dd of="$1" oflag=seek_bytes seek=$offset conv=notrunc || err "${LINENO} $label"
-    done
-}
-
-
 # <from> <to>
 diffsum() {
     local a=0
@@ -91,15 +58,54 @@ diffsum() {
     return $(($b - $a))
 }
 
-dtbsum() {
-    local a=0
+# <file>
+updatedtb() {
+    mtbs=("ubi" "netgear" "firmware")
+    local slen=80
+    declare -A dtb_offs
+    declare -A mtb_start
+    declare -A mtb_len
+    declare -A mtb_nlen
+    local content
+    local reg
+    local sfrom
+    local sto
+    local rawd
+    local sum=0
 
-    for s in ${!DTB_ORIGINAL[*]}; do
-	diffsum "${DTB_ORIGINAL[$s]}" "${DTB_MODIFIED[$s]}"
-	a=$(($a + $?))
+    for mtb in ${mtbs[*]}; do
+	dtb_offs["$mtb"]=$(strings -t d "$1" | sed -n "/^\([0-9]*\) ${mtb}@[0-9a-fA-F]\{1,\}\$/s/^\([0-9]*\) .*\$/\1/p")
+	[ $? -eq 0 -a -n "${dtb_offs["$mtb"]}" ] || err "${LINENO} $mtb"
+
+	content="$(od "$1" -j ${dtb_offs["$mtb"]} -A n -v -t x4 -N $slen -w$slen --endian=big)" || err "${LINENO} $mtb"
+	reg=${content#*0000009c }
+	[ "$content" == "$reg" ] && err "${LINENO} $mtb"
+
+	pos=$((((${#content} - ${#reg} - 1) * 4)/9))
+	dtb_offs[$mtb]=$((${dtb_offs[$mtb]} + $pos + 4))
+
+	mtb_start["$mtb"]="${reg::8}"
+	mtb_len["$mtb"]="${reg:9:8}"
+	mtb_nlen["$mtb"]="${reg:9:8}"
     done
 
-    return $(($a % 256))
+    [ $((0x${mtb_start["ubi"]} + 0x${mtb_len["ubi"]})) -eq $((0x${mtb_start["netgear"]})) ] || err "${LINENO}"
+    [ $((0x${mtb_start["firmware"]} + 0x${mtb_len["firmware"]})) -eq $((0x${mtb_start["netgear"]})) ] || err "${LINENO}"
+
+    mtb_nlen["ubi"]="$(printf '%08x' $((0x${mtb_len["ubi"]} + 0x${mtb_len["netgear"]})))" || err "${LINENO}"
+    mtb_nlen["firmware"]="$(printf '%08x' $((0x${mtb_len["firmware"]} + 0x${mtb_len["netgear"]})))" || err "${LINENO}"
+
+    for mtb in ${mtbs[*]}; do
+	[ "${mtb_len[$mtb]}" == "${mtb_nlen[$mtb]}" ] && continue
+	rawd="$(echo "${mtb_nlen[$mtb]}" | sed 's/\(..\)/\\x\1/g')" || err "${LINENO} $label"
+	echo -ne "$rawd" | dd of="$1" oflag=seek_bytes seek=${dtb_offs[$mtb]} conv=notrunc || err "${LINENO} $mtb"
+
+	sfrom="$(echo "${mtb_len[$mtb]}" | sed 's/\(..\)/ \1/g')" || err "${LINENO}"
+	sto="$(echo "${mtb_nlen[$mtb]}" | sed 's/\(..\)/ \1/g')" || err "${LINENO}"
+	diffsum "$sfrom" "$sto"
+	sum=$(($sum + $?))
+    done
+    return $(($sum % 256))
 }
 
 # <file>
@@ -131,6 +137,7 @@ mkkernel() {
     dd if="$kernel_file" of="$data_file" iflag=skip_bytes skip=$header_size bs=$data_size count=1 || err "${LINENO}"
 
     updatedtb "$data_file"
+    sum=$?
 
     data_crc32=$(crc32 "$data_file" | cut -f 1 | sed 's/\(..\)/\\x\1/g')
     [ $? -eq 0 -a -n "$data_crc32" ] || err "${LINENO}"
@@ -151,7 +158,7 @@ mkkernel() {
     dd if="$data_file" of="$kernel_file" oflag=seek_bytes seek=$header_size conv=notrunc || err "${LINENO}"
 
     diffsum "$header_original" "$header_modified"
-    return $?
+    return $((($sum + $?) % 256))
 }
 
 # <infile> <insize> <outfile>
@@ -177,12 +184,9 @@ mkfactory() {
 
     mkkernel "$kernel_file"
     sum=$?
-    echo "orig:$sum_original"
-    echo "kern:$sum"
+
     dd if="$kernel_file" of="$tmp_file" oflag=seek_bytes seek=$factory_header_size conv=notrunc || err "${LINENO}"
 
-    dtbsum
-    sum=$((($sum + $?) % 256))
     [ $sum_original -lt $sum ] && sum_original=$(($sum_original + 256))
     sum=$(($sum_original - $sum))
 
@@ -220,7 +224,7 @@ mksysupgrade() {
 
     img_crc32=$(crc32 "$tmp_file" | cut -f 1) || err "${LINENO}"
     [ $? -eq 0 -a -n "$img_crc32" ] || err "${LINENO}"
-    img_crc32="$(printf '%x' $((0xffffffff ^ 0x$img_crc32)))" || err "${LINENO}"
+    img_crc32="$(printf '%08x' $((0xffffffff ^ 0x$img_crc32)))" || err "${LINENO}"
     [ $? -eq 0 -a " $img_crc32" == "$embed_crc32" ] || err "${LINENO}"
     # image verified
 
@@ -241,7 +245,7 @@ mksysupgrade() {
     rawd="$(echo "$tr_magic" | sed 's/ /\\x/g')" || err "${LINENO}"
     echo -ne "$rawd" >> "$tmp_file" || err "${LINENO}"
 
-    rawd="$(printf '%x' $((0xFFFFFFFF ^ 0x$img_crc32)) | sed 's/\(..\)/\\x\1/g')" || err "${LINENO}"
+    rawd="$(printf '%08x' $((0xffffffff ^ 0x$img_crc32)) | sed 's/\(..\)/\\x\1/g')" || err "${LINENO}"
     echo -ne "$rawd"  >> "$tmp_file" || err "${LINENO}"
 
     dd if="$infile" iflag=skip_bytes skip=$(($insize - $tr_size + $tr_crc_offs + 4)) >> "$tmp_file" || err "${LINENO}"
